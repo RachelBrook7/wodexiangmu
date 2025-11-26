@@ -1,0 +1,172 @@
+#include <REG51.H>
+
+/* =========================================
+ *  交通灯 + 步进电机 + 键盘设定 + 4位数码管
+ *  单文件版（AT89C51，12 MHz，Keil C51）
+ * ========================================= */
+
+#define FOSC 12000000UL
+#define TMR_RELOAD_1MS (65536UL - (FOSC/12UL/1000UL))
+volatile unsigned long g_millis = 0;
+static unsigned long millis(void){ unsigned long t; EA=0; t=g_millis; EA=1; return t; }
+
+// 数码管段码（共阴，低电平位选）
+#define SEG_PORT P0
+sbit DIG1 = P2^4;
+sbit DIG2 = P2^5;
+sbit DIG3 = P2^6;
+sbit DIG4 = P2^7;
+
+// 交通灯（高电平点亮）
+sbit LED_R = P2^0;
+sbit LED_Y = P2^1;
+sbit LED_G = P2^2;
+
+// 步进电机（ULN2003 → 28BYJ-48）
+sbit M1 = P1^0;
+sbit M2 = P1^1;
+sbit M3 = P1^2;
+sbit M4 = P1^3;
+
+// 4×4 矩阵键盘：行（输出）/列（输入，上拉）
+sbit R0 = P3^0;
+sbit R1 = P3^1;
+sbit R2 = P3^2;
+sbit R3 = P3^3;
+sbit C0 = P3^4;
+sbit C1 = P3^5;
+sbit C2 = P3^6;
+sbit C3 = P3^7;
+
+#define BLANK 0x00
+#define DASH  0x40
+static const unsigned char DIGITS[10]={0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F};
+volatile unsigned char display_digits[4]={BLANK,BLANK,BLANK,BLANK};
+
+typedef enum { KEY_NONE=0,KEY_0,KEY_1,KEY_2,KEY_3,KEY_4,KEY_5,KEY_6,KEY_7,KEY_8,KEY_9,KEY_A,KEY_B,KEY_C,KEY_D,KEY_STAR,KEY_HASH } KeyCode;
+typedef struct { KeyCode code; unsigned char pressed; } KeyEvent;
+static unsigned char stable_code=KEY_NONE,last_code=KEY_NONE,debounce_cnt=0;
+#define DEBOUNCE_MS 15
+static unsigned char input_mode=0; static unsigned int input_value=0; static unsigned char input_digits=0;
+
+typedef enum { TS_RED=0, TS_YELLOW=1, TS_GREEN=2 } TrafficState;
+typedef enum { GATE_UP=0, GATE_DOWN=1 } GateState;
+volatile TrafficState t_state=TS_RED; volatile GateState g_state=GATE_DOWN;
+volatile unsigned int red_sec=10, yellow_sec=3, green_sec=10, countdown_sec=0;
+volatile unsigned char gate_cmd_up=0, gate_cmd_down=0;
+
+static const unsigned char halfstep_seq[8]={0x01,0x03,0x02,0x06,0x04,0x0C,0x08,0x09};
+#define STEPPER_STEP_MS 3
+static volatile int remaining_steps=0; static volatile unsigned char seq_idx=0; static volatile unsigned int step_timer=0;
+
+static void stepper_phase(unsigned char m){ M1=(m&1)?1:0; M2=(m&2)?1:0; M3=(m&4)?1:0; M4=(m&8)?1:0; }
+void gate_raise(void){ remaining_steps=500; }
+void gate_lower(void){ remaining_steps=-500; }
+void stepper_tick_1ms(void){
+    if(remaining_steps==0){ stepper_phase(0x00); return; }
+    if(++step_timer>=STEPPER_STEP_MS){
+        step_timer=0;
+        if(remaining_steps>0){ seq_idx=(seq_idx+1)&7; remaining_steps--; }
+        else { seq_idx=(seq_idx==0)?7:(seq_idx-1); remaining_steps++; }
+        stepper_phase(halfstep_seq[seq_idx]);
+    }
+}
+
+static KeyCode read_raw_key(void){
+    unsigned char col;
+    R0=0; R1=1; R2=1; R3=1; col=((C0==0)<<0)|((C1==0)<<1)|((C2==0)<<2)|((C3==0)<<3);
+    if(col){ if(col&1)return KEY_1; if(col&2)return KEY_2; if(col&4)return KEY_3; if(col&8)return KEY_A; }
+    R0=1; R1=0; R2=1; R3=1; col=((C0==0)<<0)|((C1==0)<<1)|((C2==0)<<2)|((C3==0)<<3);
+    if(col){ if(col&1)return KEY_4; if(col&2)return KEY_5; if(col&4)return KEY_6; if(col&8)return KEY_B; }
+    R0=1; R1=1; R2=0; R3=1; col=((C0==0)<<0)|((C1==0)<<1)|((C2==0)<<2)|((C3==0)<<3);
+    if(col){ if(col&1)return KEY_7; if(col&2)return KEY_8; if(col&4)return KEY_9; if(col&8)return KEY_C; }
+    R0=1; R1=1; R2=1; R3=0; col=((C0==0)<<0)|((C1==0)<<1)|((C2==0)<<2)|((C3==0)<<3);
+    if(col){ if(col&1)return KEY_STAR; if(col&2)return KEY_0; if(col&4)return KEY_HASH; if(col&8)return KEY_D; }
+    return KEY_NONE;
+}
+void keypad_tick_1ms(void){
+    KeyCode rc=read_raw_key();
+    if(rc==last_code){ if(debounce_cnt<DEBOUNCE_MS)debounce_cnt++; if(debounce_cnt>=DEBOUNCE_MS)stable_code=rc; }
+    else { last_code=rc; debounce_cnt=0; }
+}
+bit keypad_poll(KeyEvent *ev){
+    static unsigned char prev=KEY_NONE;
+    if(stable_code!=prev){
+        if(stable_code!=KEY_NONE){ ev->code=stable_code; ev->pressed=1; prev=stable_code; return 1; }
+        else prev=stable_code;
+    }
+    return 0;
+}
+void apply_key_event(const KeyEvent *ev){
+    if(!ev->pressed) return;
+    switch(ev->code){
+        case KEY_A: input_mode=1; input_value=0; input_digits=0; break;
+        case KEY_B: input_mode=2; input_value=0; input_digits=0; break;
+        case KEY_C: input_mode=3; input_value=0; input_digits=0; break;
+        case KEY_D:
+            if(input_mode==1 && input_digits) red_sec   = (input_value>9999?9999:input_value);
+            if(input_mode==2 && input_digits) yellow_sec= (input_value>9999?9999:input_value);
+            if(input_mode==3 && input_digits) green_sec = (input_value>9999?9999:input_value);
+            input_mode=0; input_value=0; input_digits=0; break;
+        case KEY_STAR: input_value=0; input_digits=0; break;
+        case KEY_HASH: red_sec=10; yellow_sec=3; green_sec=10; input_mode=0; input_value=0; input_digits=0; break;
+        case KEY_0: case KEY_1: case KEY_2: case KEY_3: case KEY_4:
+        case KEY_5: case KEY_6: case KEY_7: case KEY_8: case KEY_9:
+            if(input_mode && input_digits<4){ unsigned char d=(ev->code-KEY_0); input_value=input_value*10+d; input_digits++; }
+            break;
+        default: break;
+    }
+}
+void update_display_buffer(unsigned int sec){
+    if(sec>9999){ display_digits[0]=display_digits[1]=display_digits[2]=display_digits[3]=DASH; return; }
+    unsigned int t=sec; unsigned char thou=t/1000; t%=1000; unsigned char hund=t/100; t%=100; unsigned char tens=t/10; unsigned char ones=t%10;
+    display_digits[0]=thou?DIGITS[thou]:BLANK;
+    display_digits[1]=(thou||hund)?DIGITS[hund]:BLANK;
+    display_digits[2]=(thou||hund||tens)?DIGITS[tens]:BLANK;
+    display_digits[3]=DIGITS[ones];
+}
+void set_light(TrafficState s){ LED_R=(s==TS_RED); LED_Y=(s==TS_YELLOW); LED_G=(s==TS_GREEN); }
+void traffic_next_state(void){
+    switch(t_state){
+        case TS_RED:    t_state=TS_GREEN;  countdown_sec=green_sec;  set_light(t_state); gate_cmd_up=1;   break;
+        case TS_GREEN:  t_state=TS_YELLOW; countdown_sec=yellow_sec; set_light(t_state);                  break;
+        default:        t_state=TS_RED;    countdown_sec=red_sec;    set_light(t_state); gate_cmd_down=1; break;
+    }
+}
+void timer0_init_ms(void){
+    unsigned int r=(unsigned int)TMR_RELOAD_1MS;
+    TMOD&=0xF0; TMOD|=0x01; TH0=(r>>8)&0xFF; TL0=r&0xFF; ET0=1; TR0=1;
+}
+void timer1_init_ms(void){
+    unsigned int r=(unsigned int)TMR_RELOAD_1MS;
+    TMOD&=0x0F; TMOD|=0x10; TH1=(r>>8)&0xFF; TL1=r&0xFF; ET1=1; TR1=1;
+}
+void timer0_isr(void) interrupt 1{
+    unsigned int r=(unsigned int)TMR_RELOAD_1MS; TH0=(r>>8)&0xFF; TL0=r&0xFF; g_millis++;
+    static unsigned char idx=0;
+    DIG1=1; DIG2=1; DIG3=1; DIG4=1;
+    SEG_PORT=display_digits[idx];
+    if(idx==0)DIG1=0; else if(idx==1)DIG2=0; else if(idx==2)DIG3=0; else DIG4=0;
+    idx=(idx+1)&3;
+}
+void timer1_isr(void) interrupt 3{
+    unsigned int r=(unsigned int)TMR_RELOAD_1MS; TH1=(r>>8)&0xFF; TL1=r&0xFF;
+    keypad_tick_1ms(); stepper_tick_1ms();
+}
+void io_init(void){ DIG1=1; DIG2=1; DIG3=1; DIG4=1; set_light(TS_RED); }
+void main(void){
+    EA=0; io_init(); timer0_init_ms(); timer1_init_ms(); EA=1;
+    t_state=TS_RED; countdown_sec=red_sec; update_display_buffer(countdown_sec);
+    unsigned long last=millis();
+    while(1){
+        KeyEvent ev; if(keypad_poll(&ev)) apply_key_event(&ev);
+        if(gate_cmd_up){ gate_cmd_up=0; gate_raise(); g_state=GATE_UP; }
+        if(gate_cmd_down){ gate_cmd_down=0; gate_lower(); g_state=GATE_DOWN; }
+        unsigned long now=millis();
+        if(now-last>=1000){
+            last+=1000;
+            if(countdown_sec>0){ countdown_sec--; update_display_buffer(countdown_sec); }
+            else { traffic_next_state(); update_display_buffer(countdown_sec); }
+        }
+    }
+}
